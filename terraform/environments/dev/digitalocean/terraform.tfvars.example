@@ -1,0 +1,363 @@
+# terraform/environments/dev/digitalocean/terraform.tfvars.example
+# Copy this file to terraform.tfvars and customize for your environment
+
+#######################
+# Basic Configuration #
+#######################
+
+# Cluster identification
+cluster_name = "my-k8s-dev"
+environment  = "dev"
+project_name = "multi-cloud-k8s"
+
+# DigitalOcean region
+# Available regions: nyc1, nyc3, ams2, ams3, sfo1, sfo2, sfo3, sgp1, lon1, fra1, tor1, blr1, syd1
+region = "nyc3"
+
+##########################
+# Kubernetes Configuration #
+##########################
+
+# Kubernetes version prefix (latest stable within this prefix will be used)
+kubernetes_version_prefix = "1.28."
+
+# VPC Configuration
+create_vpc    = true
+vpc_ip_range = "10.0.0.0/16"
+# existing_vpc_id = "vpc-12345678"  # Only if create_vpc = false
+
+##########################
+# Node Pool Configuration #
+##########################
+
+# Main node pool configuration
+main_node_pool = {
+  size       = "s-2vcpu-4gb"    # Available sizes: s-1vcpu-1gb, s-1vcpu-2gb, s-2vcpu-2gb, s-2vcpu-4gb, s-4vcpu-8gb, etc.
+  node_count = 2                # Fixed number of nodes if auto_scale = false
+  auto_scale = true             # Enable auto-scaling
+  min_nodes  = 1                # Minimum nodes when auto-scaling
+  max_nodes  = 5                # Maximum nodes when auto-scaling
+  
+  # Node labels
+  labels = {
+    role        = "general"
+    environment = "dev"
+    cost-center = "development"
+  }
+  
+  # Node taints (empty for general workloads)
+  taints = []
+}
+
+# Additional specialized node pools
+additional_node_pools = {
+  # High-memory nodes for memory-intensive workloads
+  "memory-optimized" = {
+    size       = "m-2vcpu-16gb"
+    node_count = 1
+    auto_scale = true
+    min_nodes  = 0
+    max_nodes  = 3
+    
+    labels = {
+      workload-type = "memory-intensive"
+      node-type     = "memory-optimized"
+    }
+    
+    taints = [
+      {
+        key    = "workload"
+        value  = "memory-intensive"
+        effect = "NoSchedule"
+      }
+    ]
+  }
+  
+  # CPU-optimized nodes for compute-intensive workloads
+  "cpu-optimized" = {
+    size       = "c-4vcpu-8gb"
+    node_count = 1
+    auto_scale = true
+    min_nodes  = 0
+    max_nodes  = 5
+    
+    labels = {
+      workload-type = "cpu-intensive"
+      node-type     = "cpu-optimized"
+    }
+    
+    taints = [
+      {
+        key    = "workload"
+        value  = "cpu-intensive"
+        effect = "NoSchedule"
+      }
+    ]
+  }
+  
+  # Spot-like instances for cost optimization (using smaller instances)
+  "cost-optimized" = {
+    size       = "s-1vcpu-2gb"
+    node_count = 3
+    auto_scale = true
+    min_nodes  = 1
+    max_nodes  = 10
+    
+    labels = {
+      node-type     = "cost-optimized"
+      workload-type = "batch"
+    }
+    
+    taints = [
+      {
+        key    = "spot-instance"
+        value  = "true"
+        effect = "NoSchedule"
+      }
+    ]
+  }
+}
+
+# Common labels applied to all nodes
+common_labels = {
+  managed-by    = "terraform"
+  project       = "multi-cloud-k8s"
+  environment   = "dev"
+  team          = "platform-engineering"
+}
+
+# Cluster-wide tags
+cluster_tags = [
+  "kubernetes",
+  "development",
+  "multi-cloud",
+  "managed-by-terraform"
+]
+
+###########################
+# Cluster Feature Toggles #
+###########################
+
+# Maintenance window configuration
+maintenance_window = {
+  start_time = "04:00"  # UTC time
+  day        = "sunday"
+}
+
+# Cluster upgrade settings
+auto_upgrade   = false  # Set to true for automatic Kubernetes version upgrades
+surge_upgrade  = true   # Enable surge upgrades for better availability during upgrades
+
+#########################
+# Add-on Configuration #
+#########################
+
+# Monitoring stack (Prometheus, Grafana, AlertManager)
+install_monitoring   = true
+monitoring_namespace = "monitoring"
+
+# RBAC configuration
+configure_rbac = true
+rbac_config = {
+  # Define custom roles and bindings
+  roles = {
+    developer = {
+      rules = [
+        {
+          api_groups = ["", "apps", "extensions"]
+          resources  = ["pods", "deployments", "services", "configmaps", "secrets"]
+          verbs      = ["get", "list", "create", "update", "patch", "delete"]
+        }
+      ]
+    }
+    
+    viewer = {
+      rules = [
+        {
+          api_groups = ["", "apps", "extensions"]
+          resources  = ["pods", "deployments", "services", "configmaps"]
+          verbs      = ["get", "list"]
+        }
+      ]
+    }
+  }
+  
+  # Role bindings
+  role_bindings = {
+    developers = {
+      role = "developer"
+      subjects = [
+        {
+          kind = "User"
+          name = "developer@company.com"
+        },
+        {
+          kind = "Group"
+          name = "developers"
+        }
+      ]
+    }
+  }
+}
+
+# Security policies
+enable_security_policies = true
+security_policies = {
+  # Pod Security Standards
+  pod_security_standards = {
+    enforce = "restricted"  # Options: privileged, baseline, restricted
+    audit   = "restricted"
+    warn    = "restricted"
+  }
+  
+  # Network policies
+  default_deny_ingress = true
+  default_deny_egress  = false
+  
+  # Allowed registries for container images
+  allowed_registries = [
+    "docker.io",
+    "gcr.io",
+    "quay.io",
+    "registry.digitalocean.com"
+  ]
+}
+
+##########################
+# Backup and Monitoring #
+##########################
+
+# Backup configuration
+backup_config = {
+  enabled                = true
+  retention_period_days = 30
+  backup_schedule       = "0 2 * * *"  # Daily at 2 AM UTC
+}
+
+# Monitoring and alerting
+monitoring_config = {
+  # Prometheus configuration
+  prometheus = {
+    retention_period = "15d"
+    storage_size    = "50Gi"
+    
+    # Alert rules
+    alerts = {
+      high_cpu_usage = {
+        threshold = 80
+        duration  = "5m"
+      }
+      high_memory_usage = {
+        threshold = 85
+        duration  = "5m"
+      }
+      pod_restart_rate = {
+        threshold = 5
+        duration  = "10m"
+      }
+    }
+  }
+  
+  # Grafana configuration
+  grafana = {
+    admin_password = "change-me-in-production"  # Use secrets in production
+    persistence   = true
+    storage_size  = "10Gi"
+  }
+}
+
+########################
+# Cost Optimization   #
+########################
+
+# Cost management settings
+cost_optimization = {
+  # Enable automatic node right-sizing recommendations
+  enable_right_sizing = true
+  
+  # Cluster autoscaler settings
+  cluster_autoscaler = {
+    scale_down_delay_after_add       = "10m"
+    scale_down_unneeded_time        = "10m"
+    scale_down_utilization_threshold = 0.5
+  }
+}
+
+##################
+# Networking     #
+##################
+
+# Load balancer configuration
+load_balancer_config = {
+  # Enable sticky sessions
+  enable_sticky_sessions = false
+  
+  # Health check configuration
+  health_check = {
+    protocol             = "HTTP"
+    path                = "/health"
+    interval_seconds    = 30
+    timeout_seconds     = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
+  }
+}
+
+# Ingress configuration
+ingress_config = {
+  # Ingress controller type
+  controller_type = "nginx"  # Options: nginx, traefik, haproxy
+  
+  # SSL/TLS configuration
+  tls = {
+    enabled     = true
+    cert_source = "letsencrypt"  # Options: letsencrypt, manual, cloudflare
+  }
+}
+
+####################
+# Advanced Options #
+####################
+
+# Feature flags for experimental features
+feature_flags = {
+  enable_pod_disruption_budgets = true
+  enable_vertical_pod_autoscaler = false
+  enable_cluster_autoscaler     = true
+  enable_metrics_server         = true
+}
+
+# Custom DNS configuration
+dns_config = {
+  # Custom DNS servers (optional)
+  nameservers = []
+  
+  # DNS search domains
+  searches = []
+  
+  # DNS options
+  options = []
+}
+
+# Storage classes configuration
+storage_classes = {
+  # Fast SSD storage class
+  fast = {
+    provisioner = "dobs.csi.digitalocean.com"
+    parameters = {
+      type = "pd-ssd"
+    }
+    volume_binding_mode = "WaitForFirstConsumer"
+    allow_volume_expansion = true
+  }
+  
+  # Standard storage class
+  standard = {
+    provisioner = "dobs.csi.digitalocean.com"
+    parameters = {
+      type = "pd-standard"
+    }
+    volume_binding_mode = "WaitForFirstConsumer"
+    allow_volume_expansion = true
+  }
+}

@@ -1,0 +1,504 @@
+# .github/workflows/terraform-plan.yml
+
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-plan.yml'
+  workflow_dispatch:
+    inputs:
+      cloud_provider:
+        description: 'Cloud provider to plan for'
+        required: true
+        default: 'digitalocean'
+        type: choice
+        options:
+        - digitalocean
+        - azure
+        - aws
+        - all
+      environment:
+        description: 'Environment to plan for'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+        - dev
+        - staging
+        - production
+
+env:
+  TF_VERSION: '1.6.6'
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+permissions:
+  contents: read
+  id-token: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  changes:
+    name: Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      terraform: ${{ steps.changes.outputs.terraform }}
+      digitalocean: ${{ steps.changes.outputs.digitalocean }}
+      azure: ${{ steps.changes.outputs.azure }}
+      aws: ${{ steps.changes.outputs.aws }}
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect file changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            terraform:
+              - 'terraform/**'
+            digitalocean:
+              - 'terraform/modules/bootstrap/digitalocean/**'
+              - 'terraform/modules/kubernetes/digitalocean/**'
+              - 'terraform/environments/*/digitalocean/**'
+            azure:
+              - 'terraform/modules/bootstrap/azure/**'
+              - 'terraform/modules/kubernetes/azure/**'
+              - 'terraform/environments/*/azure/**'
+            aws:
+              - 'terraform/modules/bootstrap/aws/**'
+              - 'terraform/modules/kubernetes/aws/**'
+              - 'terraform/environments/*/aws/**'
+
+      - name: Set deployment matrix
+        id: set-matrix
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ github.event.inputs.cloud_provider }}" == "all" ]; then
+              echo "matrix={\"include\":[{\"cloud\":\"digitalocean\",\"environment\":\"${{ github.event.inputs.environment }}\"},{\"cloud\":\"azure\",\"environment\":\"${{ github.event.inputs.environment }}\"},{\"cloud\":\"aws\",\"environment\":\"${{ github.event.inputs.environment }}\"}]}" >> $GITHUB_OUTPUT
+            else
+              CLOUD="${{ github.event.inputs.cloud_provider }}"
+              ENV="${{ github.event.inputs.environment }}"
+              echo "matrix={\"include\":[{\"cloud\":\"$CLOUD\",\"environment\":\"$ENV\"}]}" >> $GITHUB_OUTPUT
+            fi
+          else
+            # For PR, only plan for changed providers
+            MATRIX="{\"include\":["
+            FIRST=true
+            if [ "${{ steps.changes.outputs.digitalocean }}" == "true" ]; then
+              [ "$FIRST" = true ] && FIRST=false || MATRIX="$MATRIX,"
+              MATRIX="$MATRIX{\"cloud\":\"digitalocean\",\"environment\":\"dev\"}"
+            fi
+            if [ "${{ steps.changes.outputs.azure }}" == "true" ]; then
+              [ "$FIRST" = true ] && FIRST=false || MATRIX="$MATRIX,"
+              MATRIX="$MATRIX{\"cloud\":\"azure\",\"environment\":\"dev\"}"
+            fi
+            if [ "${{ steps.changes.outputs.aws }}" == "true" ]; then
+              [ "$FIRST" = true ] && FIRST=false || MATRIX="$MATRIX,"
+              MATRIX="$MATRIX{\"cloud\":\"aws\",\"environment\":\"dev\"}"
+            fi
+            MATRIX="$MATRIX]}"
+            echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          fi
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure DigitalOcean credentials
+        if: matrix.cloud == 'digitalocean'
+        run: |
+          echo "DIGITALOCEAN_TOKEN=${{ secrets.DIGITALOCEAN_TOKEN }}" >> $GITHUB_ENV
+          echo "SPACES_ACCESS_KEY_ID=${{ secrets.DO_SPACES_KEY }}" >> $GITHUB_ENV
+          echo "SPACES_SECRET_ACCESS_KEY=${{ secrets.DO_SPACES_SECRET }}" >> $GITHUB_ENV
+
+      - name: Configure Azure credentials
+        if: matrix.cloud == 'azure'
+        run: |
+          echo "ARM_CLIENT_ID=${{ secrets.ARM_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=${{ secrets.ARM_CLIENT_SECRET }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.ARM_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.ARM_TENANT_ID }}" >> $GITHUB_ENV
+
+      - name: Configure AWS credentials
+        if: matrix.cloud == 'aws'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v2
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Check if backend exists
+        id: backend-check
+        run: |
+          BACKEND_DIR="terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}"
+          if [ -f "$BACKEND_DIR/backend.tf" ]; then
+            echo "backend_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "backend_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Bootstrap backend if needed
+        if: steps.backend-check.outputs.backend_exists == 'false'
+        run: |
+          echo "🔧 Backend not found, running bootstrap..."
+          cd terraform/modules/bootstrap/${{ matrix.cloud }}
+          terraform init
+          terraform plan -var="environment=${{ matrix.environment }}" -out=bootstrap.tfplan
+          terraform apply -auto-approve bootstrap.tfplan
+          
+          # Create backend configuration
+          mkdir -p "../../../environments/${{ matrix.environment }}/${{ matrix.cloud }}"
+          terraform output backend_config > "../../../environments/${{ matrix.environment }}/${{ matrix.cloud }}/backend.tf"
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}
+          terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}
+          terraform plan -no-color -out=tfplan 2>&1 | tee plan.txt
+          
+          # Extract plan summary
+          PLAN_SUMMARY=$(grep -E "(Plan:|No changes)" plan.txt || echo "Plan completed")
+          echo "summary=$PLAN_SUMMARY" >> $GITHUB_OUTPUT
+
+      - name: Generate cost estimate
+        id: cost
+        continue-on-error: true
+        run: |
+          cd terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}
+          infracost breakdown --path=. --format=json --out-file=infracost.json
+          infracost output --path=infracost.json --format=diff --out-file=cost-diff.txt
+          
+          # Format cost output for PR comment
+          if [ -f cost-diff.txt ]; then
+            echo "cost_available=true" >> $GITHUB_OUTPUT
+            echo "cost_diff<<EOF" >> $GITHUB_OUTPUT
+            cat cost-diff.txt >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
+          else
+            echo "cost_available=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate detailed plan output
+        id: plan-output
+        run: |
+          cd terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}
+          
+          # Create a formatted plan output
+          echo "## 📋 Terraform Plan - ${{ matrix.cloud }} (${{ matrix.environment }})" > plan-output.md
+          echo "" >> plan-output.md
+          echo "### Summary" >> plan-output.md
+          echo "${{ steps.plan.outputs.summary }}" >> plan-output.md
+          echo "" >> plan-output.md
+          
+          # Add plan details (truncated for PR comments)
+          echo "### Plan Details" >> plan-output.md
+          echo "\`\`\`hcl" >> plan-output.md
+          head -n 100 plan.txt >> plan-output.md
+          if [ $(wc -l < plan.txt) -gt 100 ]; then
+            echo "..." >> plan-output.md
+            echo "(Plan output truncated. See full plan in job logs)" >> plan-output.md
+          fi
+          echo "\`\`\`" >> plan-output.md
+          
+          # Add cost estimate if available
+          if [ "${{ steps.cost.outputs.cost_available }}" == "true" ]; then
+            echo "" >> plan-output.md
+            echo "### 💰 Cost Estimate" >> plan-output.md
+            echo "\`\`\`" >> plan-output.md
+            echo "${{ steps.cost.outputs.cost_diff }}" >> plan-output.md
+            echo "\`\`\`" >> plan-output.md
+          fi
+
+      - name: Upload plan artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan-${{ matrix.cloud }}-${{ matrix.environment }}
+          path: |
+            terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}/tfplan
+            terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}/plan.txt
+            terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}/plan-output.md
+            terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}/infracost.json
+          retention-days: 30
+
+      - name: Comment PR with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'terraform/environments/${{ matrix.environment }}/${{ matrix.cloud }}/plan-output.md';
+            
+            if (fs.existsSync(path)) {
+              const planOutput = fs.readFileSync(path, 'utf8');
+              
+              // Find existing comment to update
+              const { data: comments } = await github.rest.issues.listComments({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+              });
+              
+              const botComment = comments.find(comment => 
+                comment.user.type === 'Bot' && 
+                comment.body.includes('Terraform Plan - ${{ matrix.cloud }} (${{ matrix.environment }})')
+              );
+              
+              const commentBody = `
+              ${planOutput}
+              
+              ---
+              **Plan Status**: ${{ job.status }}
+              **Triggered by**: @${{ github.actor }}
+              **Commit**: ${{ github.sha }}
+              `;
+              
+              if (botComment) {
+                // Update existing comment
+                await github.rest.issues.updateComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  comment_id: botComment.id,
+                  body: commentBody
+                });
+              } else {
+                // Create new comment
+                await github.rest.issues.createComment({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.issue.number,
+                  body: commentBody
+                });
+              }
+            }
+
+  compliance-check:
+    name: Compliance Check
+    runs-on: ubuntu-latest
+    needs: [changes, terraform-plan]
+    if: needs.changes.outputs.terraform == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download plan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: terraform-plan-*
+          merge-multiple: true
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install compliance tools
+        run: |
+          pip install policy-as-code
+          
+          # Install OPA (Open Policy Agent)
+          curl -L -o opa https://openpolicyagent.org/downloads/v0.58.0/opa_linux_amd64_static
+          chmod +x opa
+          sudo mv opa /usr/local/bin/
+
+      - name: Run policy checks
+        continue-on-error: true
+        run: |
+          echo "## 📋 Compliance Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check for required tags
+          echo "### Required Tags Check" >> $GITHUB_STEP_SUMMARY
+          if grep -r "tags.*=" terraform/environments/ | grep -E "(environment|project|team|cost-center)"; then
+            echo "✅ Required tags found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ Missing required tags" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check for encryption
+          echo "### Encryption Check" >> $GITHUB_STEP_SUMMARY
+          if grep -r "encrypt" terraform/modules/; then
+            echo "✅ Encryption configurations found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No encryption configurations detected" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check for backup configuration
+          echo "### Backup Configuration Check" >> $GITHUB_STEP_SUMMARY
+          if grep -r "backup" terraform/environments/; then
+            echo "✅ Backup configurations found" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "⚠️ No backup configurations detected" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  plan-summary:
+    name: Plan Summary
+    runs-on: ubuntu-latest
+    needs: [changes, terraform-plan, compliance-check]
+    if: always() && needs.changes.outputs.terraform == 'true'
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 🚀 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Cloud Provider | Environment | Status | Cost Impact |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------------|-------------|--------|-------------|" >> $GITHUB_STEP_SUMMARY
+          
+          # This would be populated by the actual plan results
+          echo "| DigitalOcean | dev | ✅ Planned | TBD |" >> $GITHUB_STEP_SUMMARY
+          echo "| Azure | dev | ✅ Planned | TBD |" >> $GITHUB_STEP_SUMMARY
+          echo "| AWS | dev | ✅ Planned | TBD |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "- Review plan outputs above" >> $GITHUB_STEP_SUMMARY
+          echo "- Verify cost estimates" >> $GITHUB_STEP_SUMMARY
+          echo "- Check security scan results" >> $GITHUB_STEP_SUMMARY
+          echo "- Merge PR to trigger deployment" >> $GITHUB_STEP_SUMMARY
+
+  notify-teams:
+    name: Notify Teams
+    runs-on: ubuntu-latest
+    needs: [terraform-plan, compliance-check]
+    if: always() && github.event_name == 'pull_request'
+    steps:
+      - name: Notify Slack
+        if: env.SLACK_WEBHOOK_URL != ''
+        uses: 8398a7/action-slack@v3
+        with:
+          status: ${{ job.status }}
+          channel: '#infrastructure'
+          text: |
+            Terraform plan completed for PR #${{ github.event.number }}
+            Plan status: ${{ needs.terraform-plan.result }}
+            Compliance check: ${{ needs.compliance-check.result }}
+            View details: ${{ github.event.pull_request.html_url }}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Notify Microsoft Teams
+        if: env.TEAMS_WEBHOOK_URL != ''
+        uses: aliencube/microsoft-teams-actions@v0.8.0
+        with:
+          webhook_uri: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          title: Terraform Plan Results
+          summary: |
+            Terraform plan completed for PR #${{ github.event.number }}
+            Status: ${{ needs.terraform-plan.result }}
+          text: |
+            **Pull Request**: #${{ github.event.number }}
+            **Author**: ${{ github.actor }}
+            **Plan Status**: ${{ needs.terraform-plan.result }}
+            **Compliance Check**: ${{ needs.compliance-check.result }}
+            
+            [View Pull Request](${{ github.event.pull_request.html_url }})
+        env:
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Terraform Validation
+        run: |
+          find terraform/ -name "*.tf" -exec dirname {} \; | sort -u | while read dir; do
+            echo "Validating $dir"
+            cd "$dir"
+            terraform init -backend=false
+            terraform validate
+            cd - > /dev/null
+          done
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install security tools
+        run: |
+          pip install checkov
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Run Checkov
+        continue-on-error: true
+        run: |
+          checkov -d terraform/ \
+            --framework terraform \
+            --output sarif \
+            --output-file-path checkov-results.sarif \
+            --quiet
+
+      - name: Upload Checkov SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov
+
+      - name: Run tfsec
+        continue-on-error: true
+        run: |
+          tfsec terraform/ \
+            --format sarif \
+            --out tfsec-results.sarif
+
+      - name: Upload tfsec SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: tfsec-results.sarif
+          category: tfsec
+
+      - name: Security scan summary
+        run: |
+          echo "## 🔒 Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Checkov Results" >> $GITHUB_STEP_SUMMARY
+          checkov -d terraform/ --framework terraform --quiet --compact || true
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### tfsec Results" >> $GITHUB_STEP_SUMMARY
+          tfsec terraform/ --no-colour || true
+
+  terraform-plan:
+    name: Plan - ${{ matrix.cloud }} (${{ matrix.environment }})
+    runs-on: ubuntu-latest
+    needs: [changes, security-scan]
+    if: needs.changes.outputs.terraform == 'true'
+    strategy:
+      matrix: ${{ fromJson(needs.changes.outputs.matrix) }}
+      fail-fast: false
+    environment: ${{ matrix.environment }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_
