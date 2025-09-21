@@ -119,27 +119,50 @@ provider "helm" {
   }
 }
 
-# Install essential cluster components
-module "monitoring" {
-  count  = var.install_monitoring ? 1 : 0
-  source = "../../common/monitoring"
-  
-  cluster_name = var.cluster_name
-  namespace    = var.monitoring_namespace
-}
+# Find this section in terraform/modules/kubernetes/digitalocean/main.tf
+# and comment it out or remove it temporarily:
 
-module "rbac" {
-  count  = var.configure_rbac ? 1 : 0
-  source = "../../common/rbac"
-  
-  cluster_name = var.cluster_name
-  rbac_config  = var.rbac_config
-}
+# Install monitoring if enabled
+# module "monitoring" {
+#   count  = var.install_monitoring ? 1 : 0
+#   source = "../../common/monitoring"
+#   
+#   cluster_name = var.cluster_name
+#   namespace    = var.monitoring_namespace
+#   environment  = var.environment
+#   
+#   depends_on = [
+#     digitalocean_kubernetes_cluster.main,
+#     kubernetes_namespace.essential
+#   ]
+# }
 
-module "security_policies" {
-  count  = var.enable_security_policies ? 1 : 0
-  source = "../../common/security-policies"
-  
-  cluster_name     = var.cluster_name
-  security_policies = var.security_policies
-}
+# Configure RBAC if enabled
+# module "rbac" {
+#   count  = var.configure_rbac ? 1 : 0
+#   source = "../../common/rbac"
+#   
+#   cluster_name = var.cluster_name
+#   environment  = var.environment
+#   rbac_config  = var.rbac_config
+#   
+#   depends_on = [
+#     digitalocean_kubernetes_cluster.main,
+#     kubernetes_namespace.essential
+#   ]
+# }
+
+# Apply security policies if enabled
+# module "security_policies" {
+#   count  = var.enable_security_policies ? 1 : 0
+#   source = "../../common/security-policies"
+#   
+#   cluster_name      = var.cluster_name
+#   environment       = var.environment
+#   security_policies = var.security_policies
+#   
+#   depends_on = [
+#     digitalocean_kubernetes_cluster.main,
+#     kubernetes_namespace.essential
+#   ]
+# }
