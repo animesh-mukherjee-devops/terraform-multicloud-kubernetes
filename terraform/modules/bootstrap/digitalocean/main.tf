@@ -29,22 +29,17 @@ resource "digitalocean_spaces_bucket" "tfstate" {
     enabled = true
   }
 
-  # Lifecycle rule to manage old versions
-  lifecycle_rule {
-    id      = "delete-old-versions"
-    enabled = true
+  # Set ACL directly on the bucket (newer provider approach)
+  acl = "private"
 
-    noncurrent_version_expiration {
-      days = var.state_retention_days
-    }
-  }
+  # Force destroy to allow deletion even with objects
+  force_destroy = true
 }
 
-# Set bucket ACL to private
-resource "digitalocean_spaces_bucket_acl" "tfstate_acl" {
-  bucket = digitalocean_spaces_bucket.tfstate.name
-  region = digitalocean_spaces_bucket.tfstate.region
-  acl    = "private"
+# Create outputs directory
+resource "local_file" "create_outputs_dir" {
+  content  = ""
+  filename = "${path.module}/../../../outputs/.gitkeep"
 }
 
 # Output files for CI/CD integration
@@ -52,19 +47,31 @@ resource "local_file" "bucket_name" {
   content  = digitalocean_spaces_bucket.tfstate.name
   filename = "${path.module}/../../../outputs/do-bucket-${var.environment}.txt"
   
-  depends_on = [digitalocean_spaces_bucket.tfstate]
+  depends_on = [digitalocean_spaces_bucket.tfstate, local_file.create_outputs_dir]
 }
 
 resource "local_file" "bucket_region" {
   content  = digitalocean_spaces_bucket.tfstate.region
   filename = "${path.module}/../../../outputs/do-region-${var.environment}.txt"
   
-  depends_on = [digitalocean_spaces_bucket.tfstate]
+  depends_on = [digitalocean_spaces_bucket.tfstate, local_file.create_outputs_dir]
 }
 
 resource "local_file" "bucket_endpoint" {
   content  = "https://${digitalocean_spaces_bucket.tfstate.region}.digitaloceanspaces.com"
   filename = "${path.module}/../../../outputs/do-endpoint-${var.environment}.txt"
   
-  depends_on = [digitalocean_spaces_bucket.tfstate]
+  depends_on = [digitalocean_spaces_bucket.tfstate, local_file.create_outputs_dir]
+}
+
+# Create backend configuration file
+resource "local_file" "backend_config" {
+  content = templatefile("${path.module}/backend-config.tpl", {
+    bucket_name = digitalocean_spaces_bucket.tfstate.name
+    region      = digitalocean_spaces_bucket.tfstate.region
+    environment = var.environment
+  })
+  filename = "${path.module}/../../../outputs/backend-config-${var.environment}.hcl"
+  
+  depends_on = [digitalocean_spaces_bucket.tfstate, local_file.create_outputs_dir]
 }
