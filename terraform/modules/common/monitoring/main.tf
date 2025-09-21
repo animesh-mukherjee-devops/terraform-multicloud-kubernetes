@@ -1,220 +1,149 @@
-# terraform/modules/common/monitoring/variables.tf
+# terraform/modules/common/monitoring/main.tf
 
-variable "cluster_name" {
-  description = "Name of the Kubernetes cluster"
-  type        = string
-}
-
-variable "namespace" {
-  description = "Kubernetes namespace for monitoring components"
-  type        = string
-  default     = "monitoring"
-}
-
-variable "environment" {
-  description = "Environment name"
-  type        = string
-  default     = "dev"
-}
-
-##########################
-# Helm Chart Versions   #
-##########################
-
-variable "kube_prometheus_stack_version" {
-  description = "Version of the kube-prometheus-stack Helm chart"
-  type        = string
-  default     = "55.5.0"
-}
-
-variable "loki_version" {
-  description = "Version of the Loki Helm chart"
-  type        = string
-  default     = "5.41.4"
-}
-
-variable "promtail_version" {
-  description = "Version of the Promtail Helm chart"
-  type        = string
-  default     = "6.15.3"
-}
-
-##########################
-# Prometheus Configuration #
-##########################
-
-variable "prometheus_config" {
-  description = "Prometheus configuration"
-  type = object({
-    retention_period = string
-    storage_size     = string
-    storage_class    = string
-  })
-  default = {
-    retention_period = "15d"
-    storage_size     = "50Gi"
-    storage_class    = "default"
-  }
-}
-
-##########################
-# Grafana Configuration  #
-##########################
-
-variable "grafana_config" {
-  description = "Grafana configuration"
-  type = object({
-    admin_password     = string
-    storage_size       = string
-    storage_class      = string
-    enable_persistence = bool
-  })
-  default = {
-    admin_password     = "admin123!"  # Change in production
-    storage_size       = "10Gi"
-    storage_class      = "default"
-    enable_persistence = true
-  }
-  
-  sensitive = true
-}
-
-##########################
-# AlertManager Configuration #
-##########################
-
-variable "alerting_config" {
-  description = "AlertManager configuration"
-  type = object({
-    slack_webhook_url     = string
-    pagerduty_service_key = string
-    email_from           = string
-    email_to             = string
-    smtp_smarthost       = string
-    smtp_auth_username   = string
-    smtp_auth_password   = string
-  })
-  default = {
-    slack_webhook_url     = ""
-    pagerduty_service_key = ""
-    email_from           = ""
-    email_to             = ""
-    smtp_smarthost       = ""
-    smtp_auth_username   = ""
-    smtp_auth_password   = ""
-  }
-  
-  sensitive = true
-}
-
-##########################
-# Loki Configuration     #
-##########################
-
-variable "enable_loki" {
-  description = "Enable Loki for log aggregation"
-  type        = bool
-  default     = false  # Disabled by default for simpler setup
-}
-
-variable "loki_config" {
-  description = "Loki configuration"
-  type = object({
-    storage_size     = string
-    storage_class    = string
-    retention_period = string
-  })
-  default = {
-    storage_size     = "50Gi"
-    storage_class    = "default"
-    retention_period = "168h"  # 7 days
-  }
-}
-
-##########################
-# Feature Toggles        #
-##########################
-
-variable "enable_network_policies" {
-  description = "Enable network policies for monitoring namespace"
-  type        = bool
-  default     = true
-}
-
-variable "enable_pod_disruption_budgets" {
-  description = "Enable Pod Disruption Budgets for high availability"
-  type        = bool
-  default     = true
-}
-
-##########################
-# Resource Limits        #
-##########################
-
-variable "resource_limits" {
-  description = "Resource limits for monitoring components"
-  type = object({
-    prometheus = object({
-      requests = object({
-        cpu    = string
-        memory = string
-      })
-      limits = object({
-        cpu    = string
-        memory = string
-      })
-    })
-    grafana = object({
-      requests = object({
-        cpu    = string
-        memory = string
-      })
-      limits = object({
-        cpu    = string
-        memory = string
-      })
-    })
-    alertmanager = object({
-      requests = object({
-        cpu    = string
-        memory = string
-      })
-      limits = object({
-        cpu    = string
-        memory = string
-      })
-    })
-  })
-  default = {
-    prometheus = {
-      requests = {
-        cpu    = "500m"
-        memory = "2Gi"
-      }
-      limits = {
-        cpu    = "2"
-        memory = "8Gi"
-      }
+terraform {
+  required_providers {
+    kubernetes = {
+      source  = "hashicorp/kubernetes"
+      version = "~> 2.24"
     }
-    grafana = {
-      requests = {
-        cpu    = "100m"
-        memory = "128Mi"
-      }
-      limits = {
-        cpu    = "500m"
-        memory = "512Mi"
-      }
-    }
-    alertmanager = {
-      requests = {
-        cpu    = "100m"
-        memory = "128Mi"
-      }
-      limits = {
-        cpu    = "500m"
-        memory = "512Mi"
-      }
+    helm = {
+      source  = "hashicorp/helm"
+      version = "~> 2.12"
     }
   }
+}
+
+# Create monitoring namespace
+resource "kubernetes_namespace" "monitoring" {
+  metadata {
+    name = var.namespace
+    
+    labels = {
+      name                                 = var.namespace
+      "pod-security.kubernetes.io/enforce" = "privileged"
+      "pod-security.kubernetes.io/audit"   = "privileged"
+      "pod-security.kubernetes.io/warn"    = "privileged"
+    }
+  }
+}
+
+# Prometheus Stack (includes Prometheus, Grafana, AlertManager)
+resource "helm_release" "kube_prometheus_stack" {
+  name       = "kube-prometheus-stack"
+  repository = "https://prometheus-community.github.io/helm-charts"
+  chart      = "kube-prometheus-stack"
+  namespace  = kubernetes_namespace.monitoring.metadata[0].name
+  version    = var.kube_prometheus_stack_version
+
+  create_namespace = false
+  timeout          = 900
+
+  # Basic configuration without external templates
+  values = [
+    yamlencode({
+      # Prometheus configuration
+      prometheus = {
+        prometheusSpec = {
+          retention      = var.prometheus_config.retention_period
+          storageSpec = {
+            volumeClaimTemplate = {
+              spec = {
+                storageClassName = var.prometheus_config.storage_class
+                accessModes      = ["ReadWriteOnce"]
+                resources = {
+                  requests = {
+                    storage = var.prometheus_config.storage_size
+                  }
+                }
+              }
+            }
+          }
+          resources = {
+            requests = {
+              cpu    = var.resource_limits.prometheus.requests.cpu
+              memory = var.resource_limits.prometheus.requests.memory
+            }
+            limits = {
+              cpu    = var.resource_limits.prometheus.limits.cpu
+              memory = var.resource_limits.prometheus.limits.memory
+            }
+          }
+        }
+      }
+
+      # Grafana configuration
+      grafana = {
+        adminPassword = var.grafana_config.admin_password
+        persistence = {
+          enabled          = var.grafana_config.enable_persistence
+          storageClassName = var.grafana_config.storage_class
+          size            = var.grafana_config.storage_size
+        }
+        resources = {
+          requests = {
+            cpu    = var.resource_limits.grafana.requests.cpu
+            memory = var.resource_limits.grafana.requests.memory
+          }
+          limits = {
+            cpu    = var.resource_limits.grafana.limits.cpu
+            memory = var.resource_limits.grafana.limits.memory
+          }
+        }
+        # Basic dashboards
+        defaultDashboardsEnabled = true
+        # Service configuration
+        service = {
+          type = "ClusterIP"
+          port = 80
+        }
+      }
+
+      # AlertManager configuration
+      alertmanager = {
+        alertmanagerSpec = {
+          resources = {
+            requests = {
+              cpu    = var.resource_limits.alertmanager.requests.cpu
+              memory = var.resource_limits.alertmanager.requests.memory
+            }
+            limits = {
+              cpu    = var.resource_limits.alertmanager.limits.cpu
+              memory = var.resource_limits.alertmanager.limits.memory
+            }
+          }
+        }
+      }
+
+      # Disable components we don't need for basic setup
+      kubeApiServer = {
+        enabled = false
+      }
+      kubelet = {
+        enabled = true
+      }
+      kubeControllerManager = {
+        enabled = false
+      }
+      coreDns = {
+        enabled = true
+      }
+      kubeEtcd = {
+        enabled = false
+      }
+      kubeScheduler = {
+        enabled = false
+      }
+      kubeProxy = {
+        enabled = true
+      }
+      kubeStateMetrics = {
+        enabled = true
+      }
+      nodeExporter = {
+        enabled = true
+      }
+    })
+  ]
+
+  depends_on = [kubernetes_namespace.monitoring]
 }

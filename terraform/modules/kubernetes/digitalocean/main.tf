@@ -7,42 +7,37 @@ terraform {
       source  = "digitalocean/digitalocean"
       version = "~> 2.34"
     }
-    kubernetes = {
-      source  = "hashicorp/kubernetes"
-      version = "~> 2.24"
-    }
-    helm = {
-      source  = "hashicorp/helm"
-      version = "~> 2.12"
-    }
   }
 }
 
-# Data source for DigitalOcean Kubernetes versions
+# Data source for available Kubernetes versions
 data "digitalocean_kubernetes_versions" "available" {
   version_prefix = var.kubernetes_version_prefix
 }
 
-# VPC for the cluster
-resource "digitalocean_vpc" "k8s_vpc" {
+# Create VPC if requested
+resource "digitalocean_vpc" "cluster_vpc" {
   count = var.create_vpc ? 1 : 0
   
   name     = "${var.cluster_name}-vpc"
   region   = var.region
   ip_range = var.vpc_ip_range
+  
+  description = "VPC for ${var.cluster_name} Kubernetes cluster"
 }
 
-# DigitalOcean Kubernetes cluster
+# Create the Kubernetes cluster
 resource "digitalocean_kubernetes_cluster" "main" {
   name    = var.cluster_name
   region  = var.region
-  version = data.digitalocean_kubernetes_versions.available.latest_version
+  version = var.kubernetes_version != null ? var.kubernetes_version : data.digitalocean_kubernetes_versions.available.latest_version
   
-  vpc_uuid = var.create_vpc ? digitalocean_vpc.k8s_vpc[0].id : var.existing_vpc_id
-
-  # Enable auto-upgrade and surge upgrades for better availability
+  vpc_uuid = var.create_vpc ? digitalocean_vpc.cluster_vpc[0].id : var.existing_vpc_id
+  
+  # Cluster configuration
   auto_upgrade = var.auto_upgrade
   surge_upgrade = var.surge_upgrade
+  ha           = var.enable_ha
   
   # Maintenance window
   maintenance_policy {
@@ -50,29 +45,43 @@ resource "digitalocean_kubernetes_cluster" "main" {
     day        = var.maintenance_window.day
   }
 
-  # Main node pool
+  # Default node pool
   node_pool {
-    name       = "${var.cluster_name}-main-pool"
-    size       = var.main_node_pool.size
-    node_count = var.main_node_pool.node_count
-    auto_scale = var.main_node_pool.auto_scale
-    min_nodes  = var.main_node_pool.min_nodes
-    max_nodes  = var.main_node_pool.max_nodes
+    name       = var.default_node_pool.name
+    size       = var.default_node_pool.size
+    node_count = var.default_node_pool.auto_scale ? null : var.default_node_pool.node_count
+    auto_scale = var.default_node_pool.auto_scale
+    min_nodes  = var.default_node_pool.auto_scale ? var.default_node_pool.min_nodes : null
+    max_nodes  = var.default_node_pool.auto_scale ? var.default_node_pool.max_nodes : null
     
-    # Taints for main pool if needed
+    labels = merge(
+      var.common_node_labels,
+      var.default_node_pool.labels,
+      {
+        "node-pool" = var.default_node_pool.name
+        "cluster"   = var.cluster_name
+      }
+    )
+    
     dynamic "taint" {
-      for_each = var.main_node_pool.taints
+      for_each = var.default_node_pool.taints
       content {
         key    = taint.value.key
         value  = taint.value.value
         effect = taint.value.effect
       }
     }
-    
-    labels = merge(var.common_labels, var.main_node_pool.labels)
   }
 
-  tags = var.cluster_tags
+  tags = concat(
+    var.cluster_tags,
+    [
+      "kubernetes",
+      "managed-by-terraform",
+      var.environment,
+      var.cluster_name
+    ]
+  )
 }
 
 # Additional node pools
@@ -82,10 +91,19 @@ resource "digitalocean_kubernetes_node_pool" "additional" {
   cluster_id = digitalocean_kubernetes_cluster.main.id
   name       = each.key
   size       = each.value.size
-  node_count = each.value.node_count
+  node_count = each.value.auto_scale ? null : each.value.node_count
   auto_scale = each.value.auto_scale
-  min_nodes  = each.value.min_nodes
-  max_nodes  = each.value.max_nodes
+  min_nodes  = each.value.auto_scale ? each.value.min_nodes : null
+  max_nodes  = each.value.auto_scale ? each.value.max_nodes : null
+  
+  labels = merge(
+    var.common_node_labels,
+    each.value.labels,
+    {
+      "node-pool" = each.key
+      "cluster"   = var.cluster_name
+    }
+  )
   
   dynamic "taint" {
     for_each = each.value.taints
@@ -96,73 +114,19 @@ resource "digitalocean_kubernetes_node_pool" "additional" {
     }
   }
   
-  labels = merge(var.common_labels, each.value.labels)
-  tags   = var.cluster_tags
-}
-
-# Configure Kubernetes provider
-provider "kubernetes" {
-  host  = digitalocean_kubernetes_cluster.main.endpoint
-  token = digitalocean_kubernetes_cluster.main.kube_config[0].token
-  cluster_ca_certificate = base64decode(
-    digitalocean_kubernetes_cluster.main.kube_config[0].cluster_ca_certificate
+  tags = concat(
+    var.cluster_tags,
+    each.value.tags,
+    [each.key, "additional-pool"]
   )
 }
 
-provider "helm" {
-  kubernetes {
-    host  = digitalocean_kubernetes_cluster.main.endpoint
-    token = digitalocean_kubernetes_cluster.main.kube_config[0].token
-    cluster_ca_certificate = base64decode(
-      digitalocean_kubernetes_cluster.main.kube_config[0].cluster_ca_certificate
-    )
-  }
+# Write kubeconfig for CI/CD
+resource "local_file" "kubeconfig" {
+  count = var.create_output_files ? 1 : 0
+  
+  content  = digitalocean_kubernetes_cluster.main.kube_config[0].raw_config
+  filename = "${path.module}/../../../outputs/kubeconfig-${var.cluster_name}"
+  
+  depends_on = [digitalocean_kubernetes_cluster.main]
 }
-
-# Find this section in terraform/modules/kubernetes/digitalocean/main.tf
-# and comment it out or remove it temporarily:
-
-# Install monitoring if enabled
-# module "monitoring" {
-#   count  = var.install_monitoring ? 1 : 0
-#   source = "../../common/monitoring"
-#   
-#   cluster_name = var.cluster_name
-#   namespace    = var.monitoring_namespace
-#   environment  = var.environment
-#   
-#   depends_on = [
-#     digitalocean_kubernetes_cluster.main,
-#     kubernetes_namespace.essential
-#   ]
-# }
-
-# Configure RBAC if enabled
-# module "rbac" {
-#   count  = var.configure_rbac ? 1 : 0
-#   source = "../../common/rbac"
-#   
-#   cluster_name = var.cluster_name
-#   environment  = var.environment
-#   rbac_config  = var.rbac_config
-#   
-#   depends_on = [
-#     digitalocean_kubernetes_cluster.main,
-#     kubernetes_namespace.essential
-#   ]
-# }
-
-# Apply security policies if enabled
-# module "security_policies" {
-#   count  = var.enable_security_policies ? 1 : 0
-#   source = "../../common/security-policies"
-#   
-#   cluster_name      = var.cluster_name
-#   environment       = var.environment
-#   security_policies = var.security_policies
-#   
-#   depends_on = [
-#     digitalocean_kubernetes_cluster.main,
-#     kubernetes_namespace.essential
-#   ]
-# }
