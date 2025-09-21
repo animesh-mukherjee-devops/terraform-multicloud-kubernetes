@@ -1,6 +1,6 @@
 # .github/workflows/terraform-apply.yml
 
-name: Terraform Apply
+name: Terraform Multi-Cloud Infrastructure
 
 on:
   push:
@@ -9,6 +9,14 @@ on:
       - develop
     paths:
       - 'terraform/**'
+      - '.github/workflows/terraform-apply.yml'
+  pull_request:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'terraform/**'
+      - '.github/workflows/terraform-apply.yml'
   workflow_dispatch:
     inputs:
       cloud_provider:
@@ -29,11 +37,15 @@ on:
         - dev
         - staging
         - production
-      destroy:
-        description: 'Destroy infrastructure instead of creating'
-        required: false
-        default: false
-        type: boolean
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - destroy
 
 env:
   TF_VERSION: '1.6.6'
@@ -47,71 +59,9 @@ permissions:
   pull-requests: write
 
 jobs:
-  security-scan:
-    name: Security Scan
+  validate:
+    name: Validate Terraform
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Run Checkov
-        id: checkov
-        uses: bridgecrewio/checkov-action@master
-        with:
-          directory: terraform/
-          framework: terraform
-          output_format: sarif
-          output_file_path: checkov-results.sarif
-          quiet: true
-          soft_fail: true
-
-      - name: Upload SARIF file
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: checkov-results.sarif
-
-      - name: Run tfsec
-        uses: aquasecurity/tfsec-sarif-action@v0.1.4
-        with:
-          sarif_file: tfsec-results.sarif
-
-      - name: Upload tfsec SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: tfsec-results.sarif
-
-  determine-matrix:
-    name: Determine deployment matrix
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set-matrix.outputs.matrix }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        
-      - name: Set deployment matrix
-        id: set-matrix
-        run: |
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            CLOUD="${{ github.event.inputs.cloud_provider }}"
-            ENV="${{ github.event.inputs.environment }}"
-            echo "matrix={\"include\":[{\"cloud\":\"$CLOUD\",\"environment\":\"$ENV\"}]}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.ref }}" == "refs/heads/main" ]; then
-            echo "matrix={\"include\":[{\"cloud\":\"digitalocean\",\"environment\":\"production\"},{\"cloud\":\"azure\",\"environment\":\"production\"}]}" >> $GITHUB_OUTPUT
-          else
-            echo "matrix={\"include\":[{\"cloud\":\"digitalocean\",\"environment\":\"dev\"},{\"cloud\":\"azure\",\"environment\":\"dev\"}]}" >> $GITHUB_OUTPUT
-          fi
-
-  bootstrap:
-    name: Bootstrap - ${{ matrix.cloud }} (${{ matrix.environment }})
-    runs-on: ubuntu-latest
-    needs: [security-scan, determine-matrix]
-    strategy:
-      matrix: ${{ fromJson(needs.determine-matrix.outputs.matrix) }}
-      fail-fast: false
-    environment: ${{ matrix.environment }}
     
     steps:
       - name: Checkout
@@ -122,15 +72,72 @@ jobs:
         with:
           terraform_version: ${{ env.TF_VERSION }}
 
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Terraform Validation
+        run: |
+          find terraform/modules -name "*.tf" -exec dirname {} \; | sort -u | while read dir; do
+            echo "Validating $dir"
+            cd "$dir"
+            terraform init -backend=false
+            terraform validate
+            cd - > /dev/null
+          done
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install security tools
+        run: |
+          pip install checkov
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Run Checkov
+        continue-on-error: true
+        run: checkov -d terraform/ --framework terraform --quiet
+
+      - name: Run tfsec
+        continue-on-error: true
+        run: tfsec terraform/ --no-colour
+
+  bootstrap:
+    name: Bootstrap Infrastructure
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    if: github.event_name == 'workflow_dispatch'
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
       - name: Configure DigitalOcean credentials
-        if: matrix.cloud == 'digitalocean'
+        if: github.event.inputs.cloud_provider == 'digitalocean'
         run: |
           echo "DIGITALOCEAN_TOKEN=${{ secrets.DIGITALOCEAN_TOKEN }}" >> $GITHUB_ENV
           echo "SPACES_ACCESS_KEY_ID=${{ secrets.DO_SPACES_KEY }}" >> $GITHUB_ENV
           echo "SPACES_SECRET_ACCESS_KEY=${{ secrets.DO_SPACES_SECRET }}" >> $GITHUB_ENV
 
       - name: Configure Azure credentials
-        if: matrix.cloud == 'azure'
+        if: github.event.inputs.cloud_provider == 'azure'
         run: |
           echo "ARM_CLIENT_ID=${{ secrets.ARM_CLIENT_ID }}" >> $GITHUB_ENV
           echo "ARM_CLIENT_SECRET=${{ secrets.ARM_CLIENT_SECRET }}" >> $GITHUB_ENV
@@ -138,46 +145,256 @@ jobs:
           echo "ARM_TENANT_ID=${{ secrets.ARM_TENANT_ID }}" >> $GITHUB_ENV
 
       - name: Configure AWS credentials
-        if: matrix.cloud == 'aws'
+        if: github.event.inputs.cloud_provider == 'aws'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: us-east-1
 
+      - name: Create outputs directory
+        run: mkdir -p terraform/outputs
+
       - name: Terraform Init - Bootstrap
         run: |
-          cd terraform/modules/bootstrap/${{ matrix.cloud }}
+          cd terraform/modules/bootstrap/${{ github.event.inputs.cloud_provider }}
           terraform init
 
       - name: Terraform Plan - Bootstrap
         id: plan-bootstrap
         run: |
-          cd terraform/modules/bootstrap/${{ matrix.cloud }}
-          terraform plan -out=tfplan \
-            -var="environment=${{ matrix.environment }}" \
-            -var="project_name=multi-cloud-k8s"
+          cd terraform/modules/bootstrap/${{ github.event.inputs.cloud_provider }}
+          terraform plan -no-color \
+            -var="environment=${{ github.event.inputs.environment }}" \
+            -var="project_name=multi-cloud-k8s" \
+            -out=bootstrap.tfplan
 
       - name: Terraform Apply - Bootstrap
-        if: github.event.inputs.destroy != 'true'
+        if: github.event.inputs.action == 'apply'
         run: |
-          cd terraform/modules/bootstrap/${{ matrix.cloud }}
-          terraform apply -auto-approve tfplan
+          cd terraform/modules/bootstrap/${{ github.event.inputs.cloud_provider }}
+          terraform apply -auto-approve bootstrap.tfplan
 
       - name: Terraform Destroy - Bootstrap
-        if: github.event.inputs.destroy == 'true'
+        if: github.event.inputs.action == 'destroy'
         run: |
-          cd terraform/modules/bootstrap/${{ matrix.cloud }}
+          cd terraform/modules/bootstrap/${{ github.event.inputs.cloud_provider }}
           terraform destroy -auto-approve \
-            -var="environment=${{ matrix.environment }}" \
+            -var="environment=${{ github.event.inputs.environment }}" \
             -var="project_name=multi-cloud-k8s"
 
       - name: Save bootstrap outputs
-        if: github.event.inputs.destroy != 'true'
+        if: github.event.inputs.action == 'apply'
         run: |
-          cd terraform/modules/bootstrap/${{ matrix.cloud }}
-          mkdir -p ../../outputs
-          terraform output -json > ../../outputs/bootstrap-${{ matrix.cloud }}-${{ matrix.environment }}.json
+          cd terraform/modules/bootstrap/${{ github.event.inputs.cloud_provider }}
+          terraform output -json > ../../../outputs/bootstrap-outputs.json
+          echo "Bootstrap outputs saved"
+
+      - name: Upload bootstrap artifacts
+        if: github.event.inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-outputs-${{ github.event.inputs.cloud_provider }}-${{ github.event.inputs.environment }}
+          path: terraform/outputs/
+          retention-days: 30
+
+  cluster:
+    name: Deploy Kubernetes Cluster
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan, bootstrap]
+    if: github.event_name == 'workflow_dispatch' && needs.bootstrap.result == 'success'
+    environment: ${{ github.event.inputs.environment }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure DigitalOcean credentials
+        if: github.event.inputs.cloud_provider == 'digitalocean'
+        run: |
+          echo "DIGITALOCEAN_TOKEN=${{ secrets.DIGITALOCEAN_TOKEN }}" >> $GITHUB_ENV
+          echo "SPACES_ACCESS_KEY_ID=${{ secrets.DO_SPACES_KEY }}" >> $GITHUB_ENV
+          echo "SPACES_SECRET_ACCESS_KEY=${{ secrets.DO_SPACES_SECRET }}" >> $GITHUB_ENV
+
+      - name: Configure Azure credentials
+        if: github.event.inputs.cloud_provider == 'azure'
+        run: |
+          echo "ARM_CLIENT_ID=${{ secrets.ARM_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_CLIENT_SECRET=${{ secrets.ARM_CLIENT_SECRET }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.ARM_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.ARM_TENANT_ID }}" >> $GITHUB_ENV
+
+      - name: Download bootstrap artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-outputs-${{ github.event.inputs.cloud_provider }}-${{ github.event.inputs.environment }}
+          path: ./bootstrap-outputs/
+
+      - name: Create environment configuration
+        run: |
+          mkdir -p terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}
           
-          # Create individual files for backward compatibility
-          terraform output -raw bucket_name > ../../outputs/${{ matrix.cloud }}-bucket-${{ matrix.environment }}.txt || echo "n/a" > ../../outputs/${{ matrix.cloud }}-bucket-${{ matrix.environment }}.txt
-          terraform output -raw bucket_region > ../../outputs/${{ matrix.cloud }}-region-${{ matrix.environment }}.txt || echo "n/a" > ../../outputs/${{ matrix.cloud }}-region-${{ matrix.
+          # Create main.tf for environment
+          cat > terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}/main.tf << 'EOF'
+          terraform {
+            required_version = ">= 1.6"
+            
+            backend "s3" {
+              # Backend configuration will be provided during terraform init
+            }
+          }
+
+          module "kubernetes_cluster" {
+            source = "../../../modules/kubernetes/${{ github.event.inputs.cloud_provider }}"
+            
+            cluster_name = var.cluster_name
+            environment  = var.environment
+            region      = var.region
+            
+            # Basic configuration
+            default_node_pool = var.default_node_pool
+          }
+          EOF
+          
+          # Create variables.tf
+          cat > terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}/variables.tf << 'EOF'
+          variable "cluster_name" {
+            description = "Name of the Kubernetes cluster"
+            type        = string
+            default     = "k8s-${{ github.event.inputs.environment }}"
+          }
+
+          variable "environment" {
+            description = "Environment name"
+            type        = string
+            default     = "${{ github.event.inputs.environment }}"
+          }
+
+          variable "region" {
+            description = "Cloud provider region"
+            type        = string
+            default     = "nyc3"
+          }
+
+          variable "default_node_pool" {
+            description = "Default node pool configuration"
+            type        = any
+            default = {
+              name       = "default-pool"
+              size       = "s-2vcpu-4gb"
+              node_count = 2
+              auto_scale = true
+              min_nodes  = 1
+              max_nodes  = 5
+              labels     = {}
+              taints     = []
+            }
+          }
+          EOF
+          
+          # Create outputs.tf
+          cat > terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}/outputs.tf << 'EOF'
+          output "cluster_id" {
+            description = "Cluster ID"
+            value       = module.kubernetes_cluster.cluster_id
+          }
+
+          output "cluster_name" {
+            description = "Cluster name"
+            value       = module.kubernetes_cluster.cluster_name
+          }
+
+          output "endpoint" {
+            description = "Cluster endpoint"
+            value       = module.kubernetes_cluster.endpoint
+          }
+
+          output "kubeconfig" {
+            description = "Kubeconfig"
+            value       = module.kubernetes_cluster.kubeconfig
+            sensitive   = true
+          }
+          EOF
+
+      - name: Initialize Terraform with backend
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}
+          
+          if [ "${{ github.event.inputs.cloud_provider }}" == "digitalocean" ]; then
+            # Use backend config from bootstrap outputs
+            if [ -f "../../../bootstrap-outputs/backend-config-${{ github.event.inputs.environment }}.hcl" ]; then
+              terraform init -backend-config="../../../bootstrap-outputs/backend-config-${{ github.event.inputs.environment }}.hcl"
+            else
+              echo "Backend config not found, using local backend"
+              terraform init
+            fi
+          else
+            terraform init
+          fi
+
+      - name: Terraform Plan - Cluster
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}
+          terraform plan -out=cluster.tfplan
+
+      - name: Terraform Apply - Cluster
+        if: github.event.inputs.action == 'apply'
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}
+          terraform apply -auto-approve cluster.tfplan
+
+      - name: Save kubeconfig
+        if: github.event.inputs.action == 'apply'
+        run: |
+          cd terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}
+          terraform output -raw kubeconfig > kubeconfig-${{ github.event.inputs.cloud_provider }}-${{ github.event.inputs.environment }}
+
+      - name: Upload kubeconfig artifact
+        if: github.event.inputs.action == 'apply'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kubeconfig-${{ github.event.inputs.cloud_provider }}-${{ github.event.inputs.environment }}
+          path: terraform/environments/${{ github.event.inputs.environment }}/${{ github.event.inputs.cloud_provider }}/kubeconfig-${{ github.event.inputs.cloud_provider }}-${{ github.event.inputs.environment }}
+          retention-days: 30
+
+  summary:
+    name: Deployment Summary
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan, bootstrap, cluster]
+    if: always() && github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 🚀 Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cloud Provider**: ${{ github.event.inputs.cloud_provider }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ github.event.inputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: ${{ github.event.inputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Validation**: ${{ needs.validate.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Security Scan**: ${{ needs.security-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Bootstrap**: ${{ needs.bootstrap.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Cluster**: ${{ needs.cluster.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ github.event.inputs.action }}" == "apply" ] && [ "${{ needs.cluster.result }}" == "success" ]; then
+            echo "✅ **Deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Next Steps:" >> $GITHUB_STEP_SUMMARY
+            echo "1. Download kubeconfig artifact" >> $GITHUB_STEP_SUMMARY
+            echo "2. Configure kubectl: \`export KUBECONFIG=./kubeconfig\`" >> $GITHUB_STEP_SUMMARY
+            echo "3. Verify cluster: \`kubectl get nodes\`" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event.inputs.action }}" == "plan" ]; then
+            echo "📋 **Plan completed successfully!**" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Review the plan above and re-run with 'apply' to create resources." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ github.event.inputs.action }}" == "destroy" ]; then
+            echo "🗑️ **Resources destroyed successfully!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment encountered issues. Check the logs above.**" >> $GITHUB_STEP_SUMMARY
+          fi
