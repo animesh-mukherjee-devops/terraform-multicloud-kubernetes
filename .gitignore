@@ -34,7 +34,7 @@ Thumbs.db
 tmp/
 temp/
 
-# Secrets and credentials
+# Secrets and credentials (CRITICAL!)
 *.pem
 *.key
 *.crt
@@ -53,17 +53,23 @@ secrets/
 *.tar
 *.tar.gz
 
-# Node modules (if using any JS tooling)
+# Node modules
 node_modules/
 
-# Python files (if using any Python tooling)
+# Python files
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 .Python
-pip-log.txt
-pip-delete-this-directory.txt
 
 # Helm
 charts/*.tgz
+
+# Output files
+outputs/
+bootstrap-outputs/
+cluster-info.json
+*-bucket.txt
+*-region.txt
+*-endpoint.txt

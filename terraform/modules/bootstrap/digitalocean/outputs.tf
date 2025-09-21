@@ -24,7 +24,7 @@ output "backend_config" {
   description = "Backend configuration for Terraform remote state"
   value = {
     bucket                      = digitalocean_spaces_bucket.tfstate.name
-    key                        = "kubernetes/terraform.tfstate"
+    key                        = "${var.environment}/terraform.tfstate"
     region                     = "us-east-1"  # Required for S3 compatibility
     endpoint                   = "https://${digitalocean_spaces_bucket.tfstate.region}.digitaloceanspaces.com"
     skip_credentials_validation = true
@@ -32,5 +32,4 @@ output "backend_config" {
     skip_region_validation     = true
     force_path_style           = false
   }
-  sensitive = false
 }

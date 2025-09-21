@@ -11,24 +11,9 @@ variable "bucket_prefix" {
   }
 }
 
-variable "region" {
-  description = "DigitalOcean region for the Spaces bucket"
-  type        = string
-  default     = "nyc3"
-  
-  validation {
-    condition = contains([
-      "nyc1", "nyc3", "ams2", "ams3", "sfo1", "sfo2", "sfo3", 
-      "sgp1", "lon1", "fra1", "tor1", "blr1", "syd1"
-    ], var.region)
-    error_message = "Invalid DigitalOcean region specified."
-  }
-}
-
 variable "environment" {
   description = "Environment name (dev, staging, production)"
   type        = string
-  default     = "dev"
   
   validation {
     condition     = contains(["dev", "staging", "production"], var.environment)
@@ -40,6 +25,20 @@ variable "project_name" {
   description = "Name of the project"
   type        = string
   default     = "multi-cloud-k8s"
+}
+
+variable "region" {
+  description = "DigitalOcean region for the Spaces bucket"
+  type        = string
+  default     = "nyc3"
+  
+  validation {
+    condition = contains([
+      "nyc1", "nyc3", "ams2", "ams3", "sfo1", "sfo2", "sfo3", 
+      "sgp1", "lon1", "fra1", "tor1", "blr1", "syd1"
+    ], var.region)
+    error_message = "Invalid DigitalOcean region."
+  }
 }
 
 variable "state_retention_days" {

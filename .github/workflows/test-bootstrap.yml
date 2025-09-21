@@ -1,0 +1,247 @@
+# .github/workflows/test-bootstrap.yml
+
+name: Test DigitalOcean Bootstrap
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'terraform/modules/bootstrap/digitalocean/**'
+      - '.github/workflows/test-bootstrap.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'terraform/modules/bootstrap/digitalocean/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to test'
+        required: true
+        default: 'test'
+        type: choice
+        options:
+        - test
+        - dev
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'plan'
+        type: choice
+        options:
+        - plan
+        - apply
+        - destroy
+
+env:
+  TF_VERSION: '1.6.6'
+  TF_IN_AUTOMATION: true
+  TF_INPUT: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  validate:
+    name: Validate Terraform
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          terraform fmt -check -recursive terraform/
+
+      - name: Terraform Validation
+        run: |
+          cd terraform/modules/bootstrap/digitalocean
+          terraform init -backend=false
+          terraform validate
+
+      - name: Comment PR (if validation fails)
+        if: failure() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '❌ Terraform validation failed. Please check the logs and fix the issues.'
+            });
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install security tools
+        run: |
+          pip install checkov
+          curl -s https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+      - name: Run Checkov
+        continue-on-error: true
+        run: |
+          checkov -d terraform/modules/bootstrap/digitalocean/ \
+            --framework terraform \
+            --quiet
+
+      - name: Run tfsec
+        continue-on-error: true
+        run: |
+          tfsec terraform/modules/bootstrap/digitalocean/ --no-colour
+
+  test-bootstrap:
+    name: Test Bootstrap Module
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    environment: ${{ github.event.inputs.environment || 'test' }}
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Configure DigitalOcean credentials
+        run: |
+          echo "DIGITALOCEAN_TOKEN=${{ secrets.DIGITALOCEAN_TOKEN }}" >> $GITHUB_ENV
+          echo "SPACES_ACCESS_KEY_ID=${{ secrets.DO_SPACES_KEY }}" >> $GITHUB_ENV
+          echo "SPACES_SECRET_ACCESS_KEY=${{ secrets.DO_SPACES_SECRET }}" >> $GITHUB_ENV
+
+      - name: Create outputs directory
+        run: mkdir -p terraform/outputs
+
+      - name: Terraform Init
+        run: |
+          cd terraform/modules/bootstrap/digitalocean
+          terraform init
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          cd terraform/modules/bootstrap/digitalocean
+          ENV="${{ github.event.inputs.environment || 'test' }}"
+          terraform plan -no-color \
+            -var="environment=$ENV" \
+            -var="project_name=multi-cloud-k8s" \
+            -out=bootstrap.tfplan | tee plan-output.txt
+
+      - name: Comment PR with plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = 'terraform/modules/bootstrap/digitalocean/plan-output.txt';
+            
+            if (fs.existsSync(path)) {
+              const planOutput = fs.readFileSync(path, 'utf8');
+              const truncatedOutput = planOutput.length > 60000 ? 
+                planOutput.substring(0, 60000) + '\n... (truncated)' : 
+                planOutput;
+              
+              const body = `
+              ## 🌊 DigitalOcean Bootstrap Plan
+              
+              \`\`\`terraform
+              ${truncatedOutput}
+              \`\`\`
+              
+              **Status**: ${{ steps.plan.outcome }}
+              **Environment**: ${{ github.event.inputs.environment || 'test' }}
+              **Triggered by**: @${{ github.actor }}
+              `;
+              
+              github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: body
+              });
+            }
+
+      - name: Terraform Apply
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: |
+          cd terraform/modules/bootstrap/digitalocean
+          terraform apply -auto-approve bootstrap.tfplan
+
+      - name: Terraform Destroy
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+        run: |
+          cd terraform/modules/bootstrap/digitalocean
+          ENV="${{ github.event.inputs.environment }}"
+          terraform destroy -auto-approve \
+            -var="environment=$ENV" \
+            -var="project_name=multi-cloud-k8s"
+
+      - name: Save outputs
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        run: |
+          cd terraform/modules/bootstrap/digitalocean
+          
+          # Check if outputs directory exists in workspace
+          if [ ! -d "../../../outputs" ]; then
+            mkdir -p ../../../outputs
+          fi
+          
+          # Save outputs
+          terraform output -json > ../../../outputs/bootstrap-outputs.json
+          echo "Bootstrap outputs saved to outputs/bootstrap-outputs.json"
+          
+          # List outputs for verification
+          terraform output
+
+      - name: Upload outputs artifact
+        if: |
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply') ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-outputs-${{ github.event.inputs.environment || 'dev' }}
+          path: terraform/outputs/
+          retention-days: 30
+
+      - name: Summary
+        run: |
+          echo "## 🎉 Bootstrap Test Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Environment**: ${{ github.event.inputs.environment || 'test' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: ${{ github.event.inputs.action || 'plan' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Terraform Version**: ${{ env.TF_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ github.event.inputs.action }}" == "apply" ]; then
+            echo "✅ Bootstrap infrastructure created successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "📦 Outputs saved as artifact: bootstrap-outputs-${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "📋 Bootstrap plan completed successfully!" >> $GITHUB_STEP_SUMMARY
+            echo "🚀 Use 'workflow_dispatch' with 'apply' action to create resources" >> $GITHUB_STEP_SUMMARY
+          fi
