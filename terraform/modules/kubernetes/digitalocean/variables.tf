@@ -154,3 +154,4 @@ variable "security_policies" {
   description = "Security policies configuration"
   type        = any
   default     = {}
+}

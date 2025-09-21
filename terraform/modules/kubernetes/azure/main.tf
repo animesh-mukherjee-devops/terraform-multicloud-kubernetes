@@ -341,20 +341,18 @@ resource "azurerm_kubernetes_cluster" "main" {
   depends_on = [azurerm_kubernetes_cluster.main]
 }
 
+
 # Local values
 locals {
   common_tags = {
-    Environment   = var.environment
-    Project       = var.project_name
-    ManagedBy     = "terraform"
-    ClusterName   = var.cluster_name
-    CreatedDate   = formatdate("YYYY-MM-DD", timestamp())
-    CostCenter    = var.cost_center
-    Owner         = var.owner
+    Environment = var.environment
+    Project     = var.project_name
+    ManagedBy   = "terraform"
+    ClusterName = var.cluster_name
+    CreatedDate = formatdate("YYYY-MM-DD", timestamp())
+    CostCenter  = var.cost_center
+    Owner       = var.owner
   }
-} = [
-    azurerm_role_assignment.aks_network
-  ]
 }
 
 # Additional node pools
